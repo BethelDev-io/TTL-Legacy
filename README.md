@@ -27,6 +27,10 @@ This Soroban implementation makes TTL-Legacy:
 ✅ Secure (Passkey/WebAuthn authentication, no exposed seed phrases)  
 ✅ Automated (TTL expiry triggers transfer without manual intervention)
 
+## 📝 Documentation
+
+The `ranking.rs` and `matching.rs` modules include full rustdoc comments on all public items. Run `cargo doc --no-deps --open` to browse the generated documentation locally.
+
 ## 🚀 Features
 
 - **Create a Vault**: Set a beneficiary address and check-in interval
