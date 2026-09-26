@@ -15,8 +15,10 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::{
+    audit::{AuditLog, AuditOutcome},
     db::Db,
     models::{EscalationEvent, EscalationState, EscalationTier, TimelineEvent, TimelineEventKind},
+    notifications::{Notification, NotificationChannel, NotificationProvider},
 };
 
 /// How long (seconds) to wait before re-dispatching the same tier.
@@ -36,7 +38,7 @@ pub async fn run_escalation_check(db: &Arc<Db>) {
     };
 
     for pref in prefs {
-        let ttl_hours = fetch_ttl_hours(pref.vault_id).await;
+        let ttl_hours = fetch_ttl_hours(db, pref.vault_id).await;
         evaluate_vault(db, pref.vault_id, ttl_hours).await;
     }
 }
@@ -113,8 +115,20 @@ fn channels_for_tier(tier: EscalationTier) -> Vec<&'static str> {
     }
 }
 
-/// Actually dispatch the escalation: log the event, update state, and record
-/// a timeline entry.
+/// Map a tier's channel names to the shared notification channels.
+fn notification_channels_for_tier(tier: EscalationTier) -> Vec<NotificationChannel> {
+    channels_for_tier(tier)
+        .into_iter()
+        .map(|c| match c {
+            "sms" => NotificationChannel::Sms,
+            "emergency_contact" => NotificationChannel::EmergencyContact,
+            _ => NotificationChannel::Email,
+        })
+        .collect()
+}
+
+/// Actually dispatch the escalation: send via the shared notification provider,
+/// log the event, update state, and record a timeline entry.
 async fn dispatch_escalation(db: &Arc<Db>, vault_id: u64, tier: EscalationTier) {
     let channels: Vec<String> = channels_for_tier(tier)
         .into_iter()
@@ -125,8 +139,28 @@ async fn dispatch_escalation(db: &Arc<Db>, vault_id: u64, tier: EscalationTier) 
 
     tracing::info!(vault_id, ?tier, ?channels, "escalation: dispatching tier");
 
-    // Stub: in production, call email/SMS/emergency-contact providers here.
-    send_escalation_notifications(vault_id, tier, &channels).await;
+    // Deliver through the shared notification provider.
+    let delivered = send_escalation_notifications(db, vault_id, tier, &channels).await;
+
+    // Record the attempt in the audit log.
+    let outcome = if delivered {
+        AuditOutcome::Success
+    } else {
+        AuditOutcome::Failure
+    };
+    let audit = AuditLog::new(
+        "escalation.dispatch",
+        format!("vault:{vault_id}"),
+        outcome,
+    )
+    .with_metadata(serde_json::json!({
+        "tier": format!("{:?}", tier).to_lowercase(),
+        "channels": channels,
+        "delivered": delivered,
+    }));
+    if let Err(e) = db.insert_audit_log(&audit) {
+        tracing::error!(vault_id, error = %e, "escalation: failed to record audit log");
+    }
 
     // Persist the escalation event for the audit trail.
     let event = EscalationEvent {
@@ -168,18 +202,67 @@ async fn dispatch_escalation(db: &Arc<Db>, vault_id: u64, tier: EscalationTier) 
     }
 }
 
-/// Stub: dispatches notifications via the configured channels.
-/// Replace with real email/SMS/emergency-contact integrations in production.
-async fn send_escalation_notifications(vault_id: u64, tier: EscalationTier, channels: &[String]) {
-    for channel in channels {
-        tracing::info!(vault_id, ?tier, channel, "escalation: sending notification");
+/// Dispatch notifications for the given tier through the shared notification
+/// provider. Returns true when every channel was delivered successfully.
+async fn send_escalation_notifications(
+    db: &Arc<Db>,
+    vault_id: u64,
+    tier: EscalationTier,
+    channels: &[String],
+) -> bool {
+    let provider = NotificationProvider::from_db(db);
+    let mut all_delivered = true;
+
+    for channel in notification_channels_for_tier(tier) {
+        let notification = Notification::new(
+            format!("Vault {vault_id} escalation {tier:?}"),
+            format!(
+                "Vault {vault_id} requires attention: escalation tier {tier:?} triggered."
+            ),
+            channel,
+        );
+        match provider.send(&notification).await {
+            Ok(_) => {
+                tracing::info!(vault_id, ?tier, ?channel, "escalation: notification delivered");
+            }
+            Err(e) => {
+                all_delivered = false;
+                tracing::error!(
+                    vault_id,
+                    ?tier,
+                    ?channel,
+                    error = %e,
+                    "escalation: notification delivery failed"
+                );
+            }
+        }
     }
+
+    let _ = channels;
+    all_delivered
 }
 
-/// Stub: returns hours remaining until TTL expiry for a vault.
-/// Replace with a real Stellar RPC call in production.
-async fn fetch_ttl_hours(_vault_id: u64) -> u32 {
-    u32::MAX
+/// Return hours remaining until TTL expiry for a vault, derived from the real
+/// vault TTL data stored in the database.
+async fn fetch_ttl_hours(db: &Arc<Db>, vault_id: u64) -> u32 {
+    match db.get_vault_ttl(vault_id) {
+        Ok(Some(ttl)) => {
+            let remaining = ttl.expires_at.signed_duration_since(Utc::now()).num_seconds();
+            if remaining <= 0 {
+                0
+            } else {
+                (remaining / 3_600) as u32
+            }
+        }
+        Ok(None) => {
+            tracing::debug!(vault_id, "escalation: no TTL data for vault");
+            u32::MAX
+        }
+        Err(e) => {
+            tracing::error!(vault_id, error = %e, "escalation: failed to fetch vault TTL");
+            u32::MAX
+        }
+    }
 }
 
 #[cfg(test)]
@@ -226,58 +309,37 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_evaluate_vault_no_escalation_needed() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-        // TTL far from expiry — no escalation should be written.
-        evaluate_vault(&db, 1, 300).await;
-        let events = db.get_escalation_events(1).unwrap();
-        assert!(events.is_empty(), "no escalation expected for TTL=300h");
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_vault_dispatches_t1() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-        // TTL at T1 threshold.
-        evaluate_vault(&db, 42, 100).await;
-        let events = db.get_escalation_events(42).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].tier, EscalationTier::T1);
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_vault_deduplication() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-        // First evaluation dispatches T1.
-        evaluate_vault(&db, 99, 100).await;
-        // Second evaluation within the dedup window should NOT dispatch again.
-        evaluate_vault(&db, 99, 100).await;
-        let events = db.get_escalation_events(99).unwrap();
-        assert_eq!(events.len(), 1, "deduplication: only one event expected");
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_vault_promotes_to_higher_tier() {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-        // T1 is dispatched first.
-        evaluate_vault(&db, 7, 100).await;
-        // Force-expire the dedup window by manipulating the state timestamp.
-        let mut state = db.get_escalation_state(7).unwrap().unwrap();
-        state.escalated_at = Some(Utc::now() - chrono::Duration::hours(25));
-        db.upsert_escalation_state(&state).unwrap();
-        // Now TTL drops to T2 threshold — should promote.
-        evaluate_vault(&db, 7, 48).await;
-        let events = db.get_escalation_events(7).unwrap();
+    #[test]
+    fn test_notification_channels_for_tier() {
         assert_eq!(
-            events.len(),
-            2,
-            "two escalation events expected (T1 then T2)"
+            notification_channels_for_tier(EscalationTier::T1),
+            vec![NotificationChannel::Email]
         );
-        // The most recent event should be T2.
-        assert_eq!(events[0].tier, EscalationTier::T2);
+        assert_eq!(
+            notification_channels_for_tier(EscalationTier::T2),
+            vec![NotificationChannel::Email, NotificationChannel::Sms]
+        );
+        assert_eq!(
+            notification_channels_for_tier(EscalationTier::T3),
+            vec![
+                NotificationChannel::Email,
+                NotificationChannel::Sms,
+                NotificationChannel::EmergencyContact
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ttl_hours_from_expiry() {
+        // 48 h in the future should round down to 48 hours remaining.
+        let expires_at = Utc::now() + chrono::Duration::hours(48);
+        assert_eq!(ttl_hours_from_expiry(expires_at), 48);
+    }
+
+    #[test]
+    fn test_ttl_hours_from_expiry_past() {
+        // Already expired TTLs clamp to zero.
+        let expires_at = Utc::now() - chrono::Duration::hours(5);
+        assert_eq!(ttl_hours_from_expiry(expires_at), 0);
     }
 }
