@@ -12,6 +12,9 @@ name: Mutation Testing
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   mutation-testing:
     name: Mutation Testing (informational)

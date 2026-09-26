@@ -15,6 +15,10 @@ on:
           - "true"
           - "false"
 
+permissions:
+  contents: read
+  issues: write
+
 env:
   STELLAR_NETWORK: mainnet
 

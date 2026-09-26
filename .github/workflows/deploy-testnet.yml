@@ -4,6 +4,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 env:
   STELLAR_CLI_VERSION: "21.4.0"
   CARGO_TERM_COLOR: always
@@ -14,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read
-      id-token: write   # Required for OIDC if used in future
+      id-token: write
+      issues: write
 
     outputs:
       contract_id: ${{ steps.deploy.outputs.contract_id }}

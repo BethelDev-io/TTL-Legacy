@@ -5,6 +5,10 @@ on:
     - cron: '0 2 * * *' # 02:00 UTC nightly
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 env:
   STELLAR_CLI_VERSION: "21.4.0"
 
