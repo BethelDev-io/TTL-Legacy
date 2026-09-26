@@ -27,6 +27,7 @@ mod routes;
 mod sanitization;
 mod scheduler;
 mod security_headers;
+mod ttl_watch;
 mod two_factor;
 mod webhook_retry;
 
@@ -212,6 +213,24 @@ async fn main() {
     tokio::spawn(async move {
         scheduler::run(scheduler_db).await;
     });
+
+    // #1596: warn owners when a vault's storage TTL nears archival.
+    let notification_service = Arc::new(notifications::NotificationService::new(
+        Arc::new(notifications::FcmClient::new(
+            std::env::var("FCM_SERVER_KEY").unwrap_or_default(),
+            std::env::var("FCM_PROJECT_ID").unwrap_or_default(),
+        )),
+        notifications::create_token_store(),
+        notifications::create_prefs_store(),
+        notifications::create_schedule_store(),
+        notifications::create_delivery_store(),
+    ));
+    notifications::start_scheduler(Arc::clone(&notification_service), 60);
+    ttl_watch::spawn(
+        Arc::clone(&db),
+        notification_service,
+        ttl_watch::TtlWatchConfig::from_env(),
+    );
 
     let metrics = Metrics::new();
 
