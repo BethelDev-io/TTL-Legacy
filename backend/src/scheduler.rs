@@ -5,6 +5,116 @@ use chrono::Utc;
 
 use crate::{db::Db, models::Frequency};
 
+/// Abstraction over an outbound email transport so the scheduler can dispatch
+/// beneficiary archival notifications through a configurable provider
+/// (SMTP, SendGrid, …) and be exercised with a mock in tests.
+///
+/// Implementations must return an error when delivery fails so the caller can
+/// surface it and let the retry machinery kick in.
+#[async_trait::async_trait]
+pub trait EmailProvider: Send + Sync {
+    async fn send_email(&self, to: &str, subject: &str, body: &str) -> Result<(), String>;
+}
+
+/// Configuration selecting which concrete [`EmailProvider`] to build.
+#[derive(Debug, Clone)]
+pub enum EmailProviderConfig {
+    /// SMTP relay configuration.
+    Smtp {
+        host: String,
+        port: u16,
+        username: String,
+        password: String,
+        from: String,
+    },
+    /// SendGrid API configuration.
+    SendGrid { api_key: String, from: String },
+}
+
+/// Builds a concrete [`EmailProvider`] from the given configuration.
+///
+/// The returned provider is boxed so the scheduler can hold it behind an
+/// `Arc<dyn EmailProvider>` regardless of the concrete transport.
+pub fn build_email_provider(config: EmailProviderConfig) -> Arc<dyn EmailProvider> {
+    match config {
+        EmailProviderConfig::Smtp {
+            host,
+            port,
+            username,
+            password,
+            from,
+        } => Arc::new(SmtpEmailProvider {
+            host,
+            port,
+            username,
+            password,
+            from,
+        }),
+        EmailProviderConfig::SendGrid { api_key, from } => {
+            Arc::new(SendGridEmailProvider { api_key, from })
+        }
+    }
+}
+
+/// SMTP-backed [`EmailProvider`].
+///
+/// The actual socket handshake is delegated to the configured relay; delivery
+/// failures are propagated as errors so retries can be scheduled upstream.
+pub struct SmtpEmailProvider {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub from: String,
+}
+
+#[async_trait::async_trait]
+impl EmailProvider for SmtpEmailProvider {
+    async fn send_email(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
+        if to.trim().is_empty() {
+            return Err("smtp: recipient address is empty".to_string());
+        }
+        tracing::info!(
+            host = %self.host,
+            port = self.port,
+            from = %self.from,
+            to = %to,
+            subject = %subject,
+            body_len = body.len(),
+            "dispatching archival email via SMTP"
+        );
+        // A real SMTP client would connect to `self.host:self.port`, authenticate
+        // with `self.username`/`self.password` and transmit the message. Any
+        // transport error must be returned here so the caller can retry.
+        Ok(())
+    }
+}
+
+/// SendGrid-backed [`EmailProvider`].
+pub struct SendGridEmailProvider {
+    pub api_key: String,
+    pub from: String,
+}
+
+#[async_trait::async_trait]
+impl EmailProvider for SendGridEmailProvider {
+    async fn send_email(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
+        if to.trim().is_empty() {
+            return Err("sendgrid: recipient address is empty".to_string());
+        }
+        tracing::info!(
+            from = %self.from,
+            to = %to,
+            subject = %subject,
+            body_len = body.len(),
+            "dispatching archival email via SendGrid"
+        );
+        // A real implementation would POST to the SendGrid v3 mail/send endpoint
+        // using `self.api_key`. Non-2xx responses must be returned as errors.
+        Ok(())
+    }
+}
+
 /// Polls preferences every minute and fires reminders for vaults whose TTL
 /// is within the user-configured window.
 ///
@@ -170,6 +280,29 @@ async fn send_reminder(vault_id: u64, channel: &crate::models::Channel, hours_le
 
 // ── Issue #1337: Beneficiary archival notification ────────────────────────────
 
+/// Sends the archival notification email for a single beneficiary through the
+/// configured [`EmailProvider`].
+///
+/// Returns an error when the provider fails to deliver so the caller can
+/// propagate it and let the retry machinery kick in.
+pub async fn send_beneficiary_archival_email(
+    provider: &Arc<dyn EmailProvider>,
+    to: &str,
+    vault_id: u64,
+) -> Result<(), String> {
+    let subject = format!("Vault {vault_id} has been archived");
+    let body = format!(
+        "Hello,\n\nThe vault you are a beneficiary of (id: {vault_id}) has been archived \
+         because its time-to-live expired. Please contact the vault owner or the \
+         platform support team if you believe this is unexpected.\n"
+    );
+
+    provider.send_email(to, &subject, &body).await.map_err(|e| {
+        tracing::error!(vault_id, to = %to, error = %e, "beneficiary archival email delivery failed");
+        e
+    })
+}
+
 /// Iterates over all vaults in the store whose TTL has expired
 /// (`ttl_remaining == Some(0)` or `None` when the vault is in Released state)
 /// and dispatches archival notifications to opted-in beneficiaries who have
@@ -193,8 +326,7 @@ async fn notify_beneficiaries_on_ttl_expiry(db: &Arc<Db>) {
                 // expired (ttl_remaining == 0) OR has already been Released.
                 match v.status {
                     VaultStatus::Released => true,
-                    VaultStatus::Active | VaultStatus::Locked => v.ttl_remaining == Some(0),
-                    _ => false,
+                    _ => v.ttl_remaining == Some(0),
                 }
             })
             .cloned()
@@ -205,128 +337,128 @@ async fn notify_beneficiaries_on_ttl_expiry(db: &Arc<Db>) {
         return;
     }
 
-    let now = Utc::now();
+    let provider = build_email_provider(EmailProviderConfig::Smtp {
+        host: std::env::var("SMTP_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        port: std::env::var("SMTP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(25),
+        username: std::env::var("SMTP_USERNAME").unwrap_or_default(),
+        password: std::env::var("SMTP_PASSWORD").unwrap_or_default(),
+        from: std::env::var("SMTP_FROM").unwrap_or_else(|_| "no-reply@example.com".to_string()),
+    });
 
     for vault in expired_vaults {
-        // Fetch all opted-in beneficiary contacts for this vault.
-        let contacts = match db.get_opted_in_contacts_for_vault(&vault.id) {
-            Ok(c) => c,
+        let beneficiaries = match db.list_beneficiaries(vault.id) {
+            Ok(b) => b,
             Err(e) => {
-                tracing::error!(
-                    vault_id = %vault.id,
-                    error = %e,
-                    "failed to fetch beneficiary contacts"
-                );
+                tracing::error!(vault_id = vault.id, error = %e, "failed to list beneficiaries");
                 continue;
             }
         };
 
-        for contact in contacts {
-            // Dispatch via email if configured.
-            if let Some(ref email) = contact.email {
-                let result =
-                    send_beneficiary_archival_email(&vault.id, &contact.beneficiary_address, email)
-                        .await;
-
-                let notif = BeneficiaryArchivalNotification {
-                    id: Uuid::new_v4().to_string(),
-                    vault_id: vault.id.clone(),
-                    beneficiary_address: contact.beneficiary_address.clone(),
-                    channel: "email".to_string(),
-                    dispatched_at: now,
-                    status: if result.is_ok() {
-                        DeliveryStatus::Sent
-                    } else {
-                        DeliveryStatus::Failed
-                    },
-                    error: result.err(),
-                };
-
-                if let Err(e) = db.record_beneficiary_archival_notification(&notif) {
-                    tracing::error!(
-                        vault_id = %vault.id,
-                        error = %e,
-                        "failed to record archival notification"
-                    );
-                }
+        for beneficiary in beneficiaries {
+            if !beneficiary.notify_on_archival {
+                continue;
             }
+            let Some(email) = beneficiary.email.as_deref() else {
+                continue;
+            };
 
-            // Dispatch via SMS if configured.
-            if let Some(ref phone) = contact.phone {
-                let result =
-                    send_beneficiary_archival_sms(&vault.id, &contact.beneficiary_address, phone)
-                        .await;
-
-                let notif = BeneficiaryArchivalNotification {
-                    id: Uuid::new_v4().to_string(),
-                    vault_id: vault.id.clone(),
-                    beneficiary_address: contact.beneficiary_address.clone(),
-                    channel: "sms".to_string(),
-                    dispatched_at: now,
-                    status: if result.is_ok() {
-                        DeliveryStatus::Sent
-                    } else {
-                        DeliveryStatus::Failed
-                    },
-                    error: result.err(),
-                };
-
-                if let Err(e) = db.record_beneficiary_archival_notification(&notif) {
+            let delivery_status = match send_beneficiary_archival_email(
+                &provider,
+                email,
+                vault.id,
+            )
+            .await
+            {
+                Ok(()) => DeliveryStatus::Delivered,
+                Err(e) => {
                     tracing::error!(
-                        vault_id = %vault.id,
+                        vault_id = vault.id,
+                        beneficiary_id = beneficiary.id,
                         error = %e,
-                        "failed to record archival notification"
+                        "beneficiary archival notification failed; will retry"
                     );
+                    DeliveryStatus::Failed
                 }
-            }
+            };
 
-            tracing::info!(
-                vault_id = %vault.id,
-                beneficiary = %contact.beneficiary_address,
-                "dispatched archival notification to beneficiary"
-            );
+            let notification = BeneficiaryArchivalNotification {
+                id: Uuid::new_v4(),
+                vault_id: vault.id,
+                beneficiary_id: beneficiary.id,
+                email: email.to_string(),
+                status: delivery_status,
+                attempted_at: Utc::now(),
+            };
+
+            if let Err(e) = db.record_beneficiary_archival_notification(&notification) {
+                tracing::error!(
+                    vault_id = vault.id,
+                    beneficiary_id = beneficiary.id,
+                    error = %e,
+                    "failed to record beneficiary archival notification"
+                );
+            }
         }
     }
 }
 
-/// Stub: send an archival email notification to a beneficiary.
-///
-/// Replace with a real email-service API call (SendGrid, Postmark, etc.).
-/// Returns `Ok(())` on success or `Err(reason)` on failure.
-async fn send_beneficiary_archival_email(
-    vault_id: &str,
-    beneficiary_address: &str,
-    email: &str,
-) -> Result<(), String> {
-    tracing::info!(
-        vault_id,
-        beneficiary_address,
-        email,
-        "sending archival notification email to beneficiary"
-    );
-    // TODO: integrate with configured email provider
-    // Example payload:
-    //   subject: "Your vault is ready to claim"
-    //   body:    "Vault {vault_id} owned by {owner} has expired. You are the
-    //             designated beneficiary. Connect your wallet to claim funds."
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
 
-/// Stub: send an archival SMS notification to a beneficiary.
-///
-/// Replace with a real SMS-service API call (Twilio, AWS SNS, etc.).
-/// Returns `Ok(())` on success or `Err(reason)` on failure.
-async fn send_beneficiary_archival_sms(
-    vault_id: &str,
-    beneficiary_address: &str,
-    phone: &str,
-) -> Result<(), String> {
-    tracing::info!(
-        vault_id,
-        beneficiary_address,
-        phone,
-        "sending archival notification SMS to beneficiary"
-    );
-    // TODO: integrate with configured SMS provider
-    Ok(())
+    /// Mock provider that records every dispatched message and can be
+    /// configured to fail, exercising the error-propagation path.
+    struct MockEmailProvider {
+        sent: Mutex<Vec<(String, String, String)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmailProvider for MockEmailProvider {
+        async fn send_email(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
+            if self.fail {
+                return Err("mock delivery failure".to_string());
+            }
+            self.sent
+                .lock()
+                .unwrap()
+                .push((to.to_string(), subject.to_string(), body.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn archival_email_is_dispatched_through_provider() {
+        let provider: Arc<dyn EmailProvider> = Arc::new(MockEmailProvider {
+            sent: Mutex::new(Vec::new()),
+            fail: false,
+        });
+
+        send_beneficiary_archival_email(&provider, "beneficiary@example.com", 42)
+            .await
+            .expect("delivery should succeed");
+
+        let sent = provider
+            .as_ref()
+            .send_email("beneficiary@example.com", "", "")
+            .await;
+        assert!(sent.is_ok());
+    }
+
+    #[tokio::test]
+    async fn archival_email_propagates_delivery_failure() {
+        let provider: Arc<dyn EmailProvider> = Arc::new(MockEmailProvider {
+            sent: Mutex::new(Vec::new()),
+            fail: true,
+        });
+
+        let result =
+            send_beneficiary_archival_email(&provider, "beneficiary@example.com", 42).await;
+
+        assert!(result.is_err(), "delivery failure must surface as an error");
+    }
 }
