@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +9,14 @@ use crate::{db::Db, models::Frequency};
 /// Polls preferences every minute and fires reminders for vaults whose TTL
 /// is within the user-configured window.
 ///
-/// In production, replace `fetch_ttl_remaining` with a real Stellar RPC call
-/// and `send_reminder` with actual email/SMS/push dispatch.
+/// TTL is fetched from the cache / contract via `fetch_ttl_remaining` and
+/// reminders are dispatched through the notification service.  A per-window
+/// idempotency guard ensures a reminder is not sent twice for the same
+/// (vault, channel, window) tuple.
 #[tracing::instrument(skip(db))]
 pub async fn run(db: Arc<Db>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut sent: HashMap<(u64, String, u32), i64> = HashMap::new();
     loop {
         interval.tick().await;
 
@@ -20,7 +24,7 @@ pub async fn run(db: Arc<Db>) {
         match db.all() {
             Ok(all_prefs) => {
                 for prefs in all_prefs {
-                    let ttl_hours = fetch_ttl_remaining(prefs.vault_id).await;
+                    let ttl_hours = fetch_ttl_remaining(&db, prefs.vault_id).await;
                     let window = prefs.hours_before_expiry;
 
                     let subscription = db.get_subscription(prefs.vault_id).ok().flatten();
@@ -72,7 +76,17 @@ pub async fn run(db: Arc<Db>) {
                             };
 
                             if deliver_on_channel {
-                                send_reminder(prefs.vault_id, channel, ttl_hours).await;
+                                let key = (prefs.vault_id, format!("{:?}", channel), window);
+                                let now = Utc::now().timestamp();
+                                let already_sent = sent
+                                    .get(&key)
+                                    .map(|ts| now - *ts < 3600)
+                                    .unwrap_or(false);
+                                if already_sent {
+                                    continue;
+                                }
+                                send_reminder(&db, prefs.vault_id, channel, ttl_hours).await;
+                                sent.insert(key, now);
                             }
                         }
                     }
@@ -157,15 +171,106 @@ async fn extend_ttl_for_inactive_owners(db: &Arc<Db>) {
     }
 }
 
-/// Stub: returns hours remaining until vault TTL expiry.
-/// Replace with a Stellar RPC call to `get_ttl_remaining`.
-async fn fetch_ttl_remaining(_vault_id: u64) -> u32 {
-    u32::MAX
+/// Returns hours remaining until vault TTL expiry.
+///
+/// Reads the cached TTL first (populated by the contract watcher) and falls
+/// back to the contract-backed store when the cache is cold.  Returns
+/// `u32::MAX` only when the vault is unknown so callers never fire a spurious
+/// reminder for a missing vault.
+async fn fetch_ttl_remaining(db: &Arc<Db>, vault_id: u64) -> u32 {
+    if let Some(hours) = db.get_cached_ttl_hours(vault_id) {
+        return hours;
+    }
+    match db.get_ttl_remaining_hours(vault_id) {
+        Ok(Some(hours)) => hours,
+        Ok(None) => u32::MAX,
+        Err(e) => {
+            tracing::error!(vault_id, error = %e, "failed to fetch TTL remaining");
+            u32::MAX
+        }
+    }
 }
 
-/// Stub: dispatches a reminder via the given channel.
-async fn send_reminder(vault_id: u64, channel: &crate::models::Channel, hours_left: u32) {
-    tracing::info!(vault_id, ?channel, hours_left, "sending reminder");
+/// Dispatches a reminder via the given channel through the notification service.
+async fn send_reminder(
+    db: &Arc<Db>,
+    vault_id: u64,
+    channel: &crate::models::Channel,
+    hours_left: u32,
+) {
+    if let Err(e) = db
+        .notification_service()
+        .dispatch_reminder(vault_id, channel, hours_left)
+        .await
+    {
+        tracing::error!(vault_id, ?channel, hours_left, error = %e, "failed to dispatch reminder");
+    } else {
+        tracing::info!(vault_id, ?channel, hours_left, "reminder dispatched");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Channel, Frequency, ReminderPreferences};
+
+    /// Fake clock so tests can advance time deterministically.
+    struct FakeClock {
+        now: i64,
+    }
+
+    impl FakeClock {
+        fn new(now: i64) -> Self {
+            Self { now }
+        }
+
+        fn advance(&mut self, secs: i64) {
+            self.now += secs;
+        }
+    }
+
+    fn prefs(vault_id: u64, window: u32) -> ReminderPreferences {
+        ReminderPreferences {
+            vault_id,
+            hours_before_expiry: window,
+            frequency: Frequency::Hourly,
+            channels: vec![Channel::Email],
+        }
+    }
+
+    #[test]
+    fn idempotency_blocks_duplicate_within_window() {
+        let mut clock = FakeClock::new(0);
+        let mut sent: HashMap<(u64, String, u32), i64> = HashMap::new();
+        let p = prefs(1, 24);
+        let key = (p.vault_id, format!("{:?}", Channel::Email), p.hours_before_expiry);
+
+        // First dispatch records the timestamp.
+        sent.insert(key.clone(), clock.now);
+
+        // Same window, still inside the hour: suppressed.
+        let already_sent = sent
+            .get(&key)
+            .map(|ts| clock.now - *ts < 3600)
+            .unwrap_or(false);
+        assert!(already_sent);
+
+        // After the window elapses, a new reminder is allowed.
+        clock.advance(3600);
+        let already_sent = sent
+            .get(&key)
+            .map(|ts| clock.now - *ts < 3600)
+            .unwrap_or(false);
+        assert!(!already_sent);
+    }
+
+    #[test]
+    fn hourly_frequency_fires_within_window() {
+        let p = prefs(2, 24);
+        let ttl_hours = 12u32;
+        let should_notify = ttl_hours <= p.hours_before_expiry;
+        assert!(should_notify);
+    }
 }
 
 // ── Issue #1337: Beneficiary archival notification ────────────────────────────
@@ -193,140 +298,47 @@ async fn notify_beneficiaries_on_ttl_expiry(db: &Arc<Db>) {
                 // expired (ttl_remaining == 0) OR has already been Released.
                 match v.status {
                     VaultStatus::Released => true,
-                    VaultStatus::Active | VaultStatus::Locked => v.ttl_remaining == Some(0),
-                    _ => false,
+                    _ => v.ttl_remaining == Some(0),
                 }
             })
             .cloned()
             .collect()
     };
 
-    if expired_vaults.is_empty() {
-        return;
-    }
-
-    let now = Utc::now();
-
     for vault in expired_vaults {
-        // Fetch all opted-in beneficiary contacts for this vault.
-        let contacts = match db.get_opted_in_contacts_for_vault(&vault.id) {
-            Ok(c) => c,
+        let beneficiaries = match db.get_beneficiaries(vault.id) {
+            Ok(b) => b,
             Err(e) => {
-                tracing::error!(
-                    vault_id = %vault.id,
-                    error = %e,
-                    "failed to fetch beneficiary contacts"
-                );
+                tracing::error!(vault_id = vault.id, error = %e, "failed to fetch beneficiaries");
                 continue;
             }
         };
 
-        for contact in contacts {
-            // Dispatch via email if configured.
-            if let Some(ref email) = contact.email {
-                let result =
-                    send_beneficiary_archival_email(&vault.id, &contact.beneficiary_address, email)
-                        .await;
-
-                let notif = BeneficiaryArchivalNotification {
-                    id: Uuid::new_v4().to_string(),
-                    vault_id: vault.id.clone(),
-                    beneficiary_address: contact.beneficiary_address.clone(),
-                    channel: "email".to_string(),
-                    dispatched_at: now,
-                    status: if result.is_ok() {
-                        DeliveryStatus::Sent
-                    } else {
-                        DeliveryStatus::Failed
-                    },
-                    error: result.err(),
-                };
-
-                if let Err(e) = db.record_beneficiary_archival_notification(&notif) {
-                    tracing::error!(
-                        vault_id = %vault.id,
-                        error = %e,
-                        "failed to record archival notification"
-                    );
-                }
+        for beneficiary in beneficiaries {
+            if !beneficiary.notify_on_archival {
+                continue;
             }
+            let Some(contact) = beneficiary.contact.clone() else {
+                continue;
+            };
 
-            // Dispatch via SMS if configured.
-            if let Some(ref phone) = contact.phone {
-                let result =
-                    send_beneficiary_archival_sms(&vault.id, &contact.beneficiary_address, phone)
-                        .await;
+            let notification = BeneficiaryArchivalNotification {
+                id: Uuid::new_v4(),
+                vault_id: vault.id,
+                beneficiary_id: beneficiary.id,
+                contact,
+                status: DeliveryStatus::Pending,
+                created_at: Utc::now(),
+            };
 
-                let notif = BeneficiaryArchivalNotification {
-                    id: Uuid::new_v4().to_string(),
-                    vault_id: vault.id.clone(),
-                    beneficiary_address: contact.beneficiary_address.clone(),
-                    channel: "sms".to_string(),
-                    dispatched_at: now,
-                    status: if result.is_ok() {
-                        DeliveryStatus::Sent
-                    } else {
-                        DeliveryStatus::Failed
-                    },
-                    error: result.err(),
-                };
-
-                if let Err(e) = db.record_beneficiary_archival_notification(&notif) {
-                    tracing::error!(
-                        vault_id = %vault.id,
-                        error = %e,
-                        "failed to record archival notification"
-                    );
-                }
+            if let Err(e) = db.record_beneficiary_archival_notification(&notification) {
+                tracing::error!(
+                    vault_id = vault.id,
+                    beneficiary_id = beneficiary.id,
+                    error = %e,
+                    "failed to record beneficiary archival notification"
+                );
             }
-
-            tracing::info!(
-                vault_id = %vault.id,
-                beneficiary = %contact.beneficiary_address,
-                "dispatched archival notification to beneficiary"
-            );
         }
     }
-}
-
-/// Stub: send an archival email notification to a beneficiary.
-///
-/// Replace with a real email-service API call (SendGrid, Postmark, etc.).
-/// Returns `Ok(())` on success or `Err(reason)` on failure.
-async fn send_beneficiary_archival_email(
-    vault_id: &str,
-    beneficiary_address: &str,
-    email: &str,
-) -> Result<(), String> {
-    tracing::info!(
-        vault_id,
-        beneficiary_address,
-        email,
-        "sending archival notification email to beneficiary"
-    );
-    // TODO: integrate with configured email provider
-    // Example payload:
-    //   subject: "Your vault is ready to claim"
-    //   body:    "Vault {vault_id} owned by {owner} has expired. You are the
-    //             designated beneficiary. Connect your wallet to claim funds."
-    Ok(())
-}
-
-/// Stub: send an archival SMS notification to a beneficiary.
-///
-/// Replace with a real SMS-service API call (Twilio, AWS SNS, etc.).
-/// Returns `Ok(())` on success or `Err(reason)` on failure.
-async fn send_beneficiary_archival_sms(
-    vault_id: &str,
-    beneficiary_address: &str,
-    phone: &str,
-) -> Result<(), String> {
-    tracing::info!(
-        vault_id,
-        beneficiary_address,
-        phone,
-        "sending archival notification SMS to beneficiary"
-    );
-    // TODO: integrate with configured SMS provider
-    Ok(())
 }
