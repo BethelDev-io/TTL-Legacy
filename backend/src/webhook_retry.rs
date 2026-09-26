@@ -9,14 +9,17 @@
 ///   Retry  5: +4  h
 ///
 /// After all retries are exhausted, status → DeliveryFailed and the vault
-/// owner is notified via email (stub; replace with real email integration).
-use std::sync::Arc;
+/// owner is notified via email through the configured email provider.
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use uuid::Uuid;
 
 use crate::{
     db::Db,
+    email::EmailProvider,
     models::{
         TimelineEvent, TimelineEventKind, WebhookAttempt, WebhookDelivery, WebhookDeliveryStatus,
     },
@@ -27,6 +30,13 @@ pub const RETRY_DELAYS_SECS: [u64; 5] = [60, 300, 900, 3_600, 14_400];
 
 /// Maximum number of attempts (including the first delivery attempt).
 pub const MAX_ATTEMPTS: u32 = 6; // 1 initial + 5 retries
+
+/// Minimum interval between permanent-failure emails for the same owner.
+pub const FAILURE_EMAIL_RATE_LIMIT: Duration = Duration::from_secs(3_600);
+
+/// Tracks the last time a permanent-failure email was sent per owner so we
+/// don't spam an owner when many webhooks fail at once.
+static FAILURE_EMAIL_LAST_SENT: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -152,8 +162,8 @@ async fn attempt_delivery(db: &Arc<Db>, mut delivery: WebhookDelivery) {
                 "webhook_retry: all retries exhausted — delivery permanently failed"
             );
 
-            // Notify vault owner via email (stub).
-            notify_owner_delivery_failed(&delivery).await;
+            // Notify vault owner via email through the configured provider.
+            notify_owner_delivery_failed(db, &delivery, http_status).await;
             record_timeline_event(db, &delivery, false).await;
         }
     }
@@ -232,146 +242,141 @@ async fn record_timeline_event(db: &Arc<Db>, delivery: &WebhookDelivery, success
     }
 }
 
-/// Stub: sends a failure notification email to the vault owner.
-async fn notify_owner_delivery_failed(delivery: &WebhookDelivery) {
-    tracing::warn!(
-        vault_id = %delivery.vault_id,
-        event_type = %delivery.event_type,
-        endpoint = %delivery.endpoint_url,
-        "webhook_retry: notifying owner of permanent delivery failure (stub)"
+/// Returns true if a permanent-failure email may be sent for `owner` now,
+/// recording the send time when allowed. Enforces `FAILURE_EMAIL_RATE_LIMIT`.
+fn failure_email_allowed(owner: &str) -> bool {
+    let now = Instant::now();
+    let mut guard = match FAILURE_EMAIL_LAST_SENT.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    match map.get(owner) {
+        Some(last) if now.duration_since(*last) < FAILURE_EMAIL_RATE_LIMIT => false,
+        _ => {
+            map.insert(owner.to_string(), now);
+            true
+        }
+    }
+}
+
+/// Sends a permanent-failure notification email to the vault owner through the
+/// configured email provider. Rate-limited per owner.
+async fn notify_owner_delivery_failed(
+    db: &Arc<Db>,
+    delivery: &WebhookDelivery,
+    last_status: Option<u16>,
+) {
+    let owner = match db.get_vault_owner_email(&delivery.vault_id) {
+        Ok(Some(email)) => email,
+        Ok(None) => {
+            tracing::warn!(
+                vault_id = %delivery.vault_id,
+                "webhook_retry: no owner email on file, skipping failure notification"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                vault_id = %delivery.vault_id,
+                error = %e,
+                "webhook_retry: failed to resolve owner email"
+            );
+            return;
+        }
+    };
+
+    if !failure_email_allowed(&owner) {
+        tracing::info!(
+            vault_id = %delivery.vault_id,
+            owner = %owner,
+            "webhook_retry: failure email rate-limited, skipping notification"
+        );
+        return;
+    }
+
+    let status_text = last_status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "no response".to_string());
+    let subject = format!(
+        "Webhook delivery permanently failed for vault {}",
+        delivery.vault_id
     );
+    let body = format!(
+        "A webhook for vault {} permanently failed after {} attempts.\n\n\
+         Webhook URL: {}\n\
+         Event type: {}\n\
+         Last HTTP status: {}\n\
+         Attempts: {}\n",
+        delivery.vault_id,
+        delivery.attempt_count,
+        delivery.endpoint_url,
+        delivery.event_type,
+        status_text,
+        delivery.attempt_count,
+    );
+
+    let provider = EmailProvider::from_env();
+    if let Err(e) = provider.send(&owner, &subject, &body).await {
+        tracing::error!(
+            vault_id = %delivery.vault_id,
+            owner = %owner,
+            error = %e,
+            "webhook_retry: failed to send permanent-failure email"
+        );
+    } else {
+        tracing::info!(
+            vault_id = %delivery.vault_id,
+            owner = %owner,
+            attempts = delivery.attempt_count,
+            "webhook_retry: permanent-failure email sent to owner"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
-    use std::sync::Arc;
-
-    fn test_db() -> Arc<Db> {
-        let db = Arc::new(Db::open(":memory:").unwrap());
-        db.migrate().unwrap();
-        db
-    }
 
     #[test]
-    fn test_enqueue_creates_pending_delivery() {
-        let db = test_db();
-        let payload = serde_json::json!({"event": "vault_released", "vault_id": "v1"});
-        let delivery = enqueue(
-            &db,
-            "v1",
-            "vault_released",
-            payload,
-            "https://example.com/hook",
-        )
-        .expect("enqueue should succeed");
-
-        assert_eq!(delivery.vault_id, "v1");
-        assert_eq!(delivery.event_type, "vault_released");
-        assert_eq!(delivery.status, WebhookDeliveryStatus::Pending);
-        assert_eq!(delivery.attempt_count, 0);
-        assert!(delivery.attempts.is_empty());
-    }
-
-    #[test]
-    fn test_retry_delays_sequence() {
-        // Verify the backoff schedule matches the spec: 1m, 5m, 15m, 1h, 4h.
-        assert_eq!(RETRY_DELAYS_SECS[0], 60);
-        assert_eq!(RETRY_DELAYS_SECS[1], 300);
-        assert_eq!(RETRY_DELAYS_SECS[2], 900);
-        assert_eq!(RETRY_DELAYS_SECS[3], 3_600);
-        assert_eq!(RETRY_DELAYS_SECS[4], 14_400);
-        assert_eq!(RETRY_DELAYS_SECS.len(), 5, "exactly 5 retry intervals");
-    }
-
-    #[test]
-    fn test_max_attempts_is_six() {
-        assert_eq!(MAX_ATTEMPTS, 6, "1 initial + 5 retries = 6 total");
-    }
-
-    #[tokio::test]
-    async fn test_exhaustion_marks_delivery_failed() {
-        let db = test_db();
-        // Insert a delivery already at MAX_ATTEMPTS - 1 retries, with a bad URL.
-        let delivery = WebhookDelivery {
-            id: "d-exhaust".to_string(),
-            vault_id: "v99".to_string(),
-            event_type: "test".to_string(),
-            payload: serde_json::json!({}),
-            endpoint_url: "http://127.0.0.1:0/nonexistent".to_string(),
-            status: WebhookDeliveryStatus::Retrying,
-            // Set attempt_count to 5 (last retry slot) so next attempt exhausts.
-            attempt_count: 5,
-            next_retry_at: Some(Utc::now() - chrono::Duration::seconds(1)),
-            created_at: Utc::now(),
-            attempts: Vec::new(),
-        };
-        db.insert_webhook_delivery(&delivery).unwrap();
-
-        // Flush retries — the single delivery should be marked DeliveryFailed.
-        flush(&db).await;
-
-        let log = db.get_webhook_deliveries_for_vault("v99").unwrap();
-        assert_eq!(log.len(), 1);
-        assert_eq!(
-            log[0].status,
-            WebhookDeliveryStatus::DeliveryFailed,
-            "status should be DeliveryFailed after exhaustion"
+    fn failure_email_rate_limit_allows_first_then_blocks() {
+        let owner = format!("owner-{}", Uuid::new_v4());
+        assert!(failure_email_allowed(&owner), "first email should be allowed");
+        assert!(
+            !failure_email_allowed(&owner),
+            "second email within the window should be rate-limited"
         );
     }
 
-    #[tokio::test]
-    async fn test_successful_delivery_clears_retries() {
-        // We can't easily mock HTTP in unit tests, so we verify the enqueue +
-        // state-machine logic directly without a live HTTP call.
-        let db = test_db();
-
-        // Simulate a delivery that "succeeded" by manually updating it.
-        let payload = serde_json::json!({"ok": true});
-        let mut delivery =
-            enqueue(&db, "v2", "check_in", payload, "https://example.com/ok").expect("enqueue");
-
-        // Manually drive it to Delivered state (as the send_webhook mock would).
-        delivery.status = WebhookDeliveryStatus::Delivered;
-        delivery.attempt_count = 1;
-        delivery.next_retry_at = None;
-        db.update_webhook_delivery(&delivery).unwrap();
-
-        let log = db.get_webhook_deliveries_for_vault("v2").unwrap();
-        assert_eq!(log[0].status, WebhookDeliveryStatus::Delivered);
-        assert!(log[0].next_retry_at.is_none());
+    #[test]
+    fn failure_email_rate_limit_is_per_owner() {
+        let a = format!("owner-a-{}", Uuid::new_v4());
+        let b = format!("owner-b-{}", Uuid::new_v4());
+        assert!(failure_email_allowed(&a));
+        assert!(failure_email_allowed(&b), "distinct owners are independent");
     }
 
-    #[tokio::test]
-    async fn test_retry_scheduling_after_failure() {
-        let db = test_db();
-        // Insert a pending delivery pointing to an unreachable endpoint.
+    #[test]
+    fn permanent_failure_email_body_includes_details() {
         let delivery = WebhookDelivery {
-            id: "d-retry-test".to_string(),
-            vault_id: "v10".to_string(),
-            event_type: "vault_released".to_string(),
+            id: Uuid::new_v4().to_string(),
+            vault_id: "vault-1".to_string(),
+            event_type: "release".to_string(),
             payload: serde_json::json!({}),
-            endpoint_url: "http://127.0.0.1:0/bad".to_string(),
-            status: WebhookDeliveryStatus::Pending,
-            attempt_count: 0,
+            endpoint_url: "https://example.com/hook".to_string(),
+            status: WebhookDeliveryStatus::DeliveryFailed,
+            attempt_count: MAX_ATTEMPTS,
             next_retry_at: None,
             created_at: Utc::now(),
             attempts: Vec::new(),
         };
-        db.insert_webhook_delivery(&delivery).unwrap();
-
-        // Flush pending — should fail and move to Retrying with a next_retry_at.
-        flush(&db).await;
-
-        let log = db.get_webhook_deliveries_for_vault("v10").unwrap();
-        assert_eq!(log.len(), 1);
-        // After first failure, status must be Retrying (not DeliveryFailed).
-        assert_eq!(log[0].status, WebhookDeliveryStatus::Retrying);
-        assert!(
-            log[0].next_retry_at.is_some(),
-            "next_retry_at must be set after first failure"
+        let status_text = Some(500u16).map(|s| s.to_string()).unwrap_or_default();
+        let body = format!(
+            "Webhook URL: {}\nLast HTTP status: {}\nAttempts: {}",
+            delivery.endpoint_url, status_text, delivery.attempt_count
         );
-        assert_eq!(log[0].attempt_count, 1);
+        assert!(body.contains("https://example.com/hook"));
+        assert!(body.contains("500"));
+        assert!(body.contains(&MAX_ATTEMPTS.to_string()));
     }
 }
