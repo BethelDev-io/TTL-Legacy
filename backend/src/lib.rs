@@ -15,7 +15,9 @@ pub mod otel;
 pub mod routes;
 /// Issue #1199: request input sanitization middleware
 pub mod sanitization;
+pub mod scheduler;
 pub mod security_headers;
+pub mod sms;
 pub mod templates;
 pub mod two_factor;
 pub mod webhook_retry;
@@ -27,5 +29,6 @@ pub use fee_sponsorship::*;
 pub use handlers::*;
 pub use models::*;
 pub use notifications::*;
+pub use sms::*;
 pub use templates::*;
 pub use websocket::*;
