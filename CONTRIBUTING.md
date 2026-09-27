@@ -83,6 +83,71 @@ This points the backend at your local Stellar Quickstart instance instead of tes
    ```
 5. **Pull Requests:** Open a PR against main. Ensure your PR description clearly outlines the changes and links to the relevant issue.
 
+## Stellar Wave Contributors
+
+Contributors from the Stellar Wave program can pick up and complete issues following this process:
+
+### Picking Up an Issue
+
+1. **Check the issue labels:** Look for issues labeled with:
+   - `good-first-issue` - Great for new contributors
+   - `help-wanted` - Community contributions welcome
+   - `stellar-wave` - Specifically for Stellar Wave participants
+   
+2. **Read the issue description:** Each issue has:
+   - A clear description of what needs to be done
+   - Estimated time to complete
+   - Priority level (Low, Medium, High)
+   - Category (e.g., Testing, Documentation, Feature, etc.)
+
+3. **Comment on the issue:** Before starting work, comment on the issue to claim it:
+   ```
+   @ttl-legacy-bot claim
+   ```
+   This prevents duplicate work.
+
+### Completing an Issue
+
+1. **Create a feature branch:** Use the issue number and a descriptive name:
+   ```bash
+   git checkout -b feat/issue-XXXX-brief-description
+   ```
+
+2. **Follow the development workflow** (see above section)
+
+3. **Link your PR to the issue:** In your PR description, include:
+   ```
+   Closes #XXXX
+   ```
+   Replace `XXXX` with the issue number. This automatically closes the issue when merged.
+
+4. **PR Description Template:** Use this template:
+   ```markdown
+   ## Summary
+   Brief description of what this PR does.
+
+   ## Changes
+   - Change 1
+   - Change 2
+   - Change 3
+
+   ## Testing
+   How to test these changes locally.
+
+   Closes #XXXX
+   ```
+
+5. **Wait for review:** A maintainer will review your PR within 48 hours.
+
+### Issue Categories & Guide
+
+| Category | What to expect | PR checklist |
+|----------|---|---|
+| **Testing** | Add or improve test coverage | - Tests compile and pass locally<br>- New tests have clear assertions<br>- Run `just test` before submitting |
+| **Documentation** | Add or update docs/guides | - Docs are clear and accurate<br>- Examples are tested<br>- Follow existing formatting |
+| **Feature** | Implement new functionality | - All above + feature works end-to-end<br>- Add tests for new features<br>- Update relevant docs |
+| **Bug Fix** | Resolve reported bugs | - Root cause identified<br>- Fix is minimal and targeted<br>- Add regression test |
+
 ## Automated Security Scanning in CI
 
 The CI pipeline includes three layers of automated security scanning that run on every push and pull request:
