@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{db::Db, models::Frequency};
 
@@ -13,12 +14,22 @@ use crate::{db::Db, models::Frequency};
 /// reminders are dispatched through the notification service.  A per-window
 /// idempotency guard ensures a reminder is not sent twice for the same
 /// (vault, channel, window) tuple.
-#[tracing::instrument(skip(db))]
-pub async fn run(db: Arc<Db>) {
+///
+/// The loop observes `shutdown` so that SIGTERM can stop the scheduler
+/// gracefully: once the token is cancelled the current tick is allowed to
+/// finish (draining in-flight jobs) and the loop exits.
+#[tracing::instrument(skip(db, shutdown))]
+pub async fn run(db: Arc<Db>, shutdown: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     let mut sent: HashMap<(u64, String, u32), i64> = HashMap::new();
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("scheduler received shutdown signal, draining in-flight jobs");
+                break;
+            }
+            _ = interval.tick() => {}
+        }
 
         // 1) Existing reminder preferences scheduler.
         match db.all() {
@@ -321,6 +332,19 @@ async fn notify_beneficiaries_on_ttl_expiry(db: &Arc<Db>) {
             let Some(contact) = beneficiary.contact.clone() else {
                 continue;
             };
+
+            if db
+                .beneficiary_notified_within_last_hour(vault.id, beneficiary.id)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            tracing::info!(
+                vault_id = vault.id,
+                beneficiary_id = beneficiary.id,
+                "dispatching beneficiary archival notification"
+            );
 
             let notification = BeneficiaryArchivalNotification {
                 id: Uuid::new_v4(),
