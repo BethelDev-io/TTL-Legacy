@@ -17,6 +17,8 @@ pub mod routes;
 pub mod sanitization;
 pub mod security_headers;
 pub mod templates;
+/// Issue #1596: owner warning when storage TTL nears archival
+pub mod ttl_watch;
 pub mod two_factor;
 pub mod webhook_retry;
 pub mod websocket;
