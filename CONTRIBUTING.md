@@ -50,7 +50,7 @@ We welcome contributions! Please follow these guidelines to help us maintain pro
 
 6. **Start the frontend dev server:**
    ```bash
-   cd frontend && npm run dev
+   just frontend-dev
    ```
    The frontend dev server runs at `http://localhost:5173`.
 
@@ -152,11 +152,39 @@ Available recipes:
     deploy-testnet-force# Force-redeploy to testnet without confirmation prompt
     docker-down         # Stop and remove local dev stack containers
     docker-up           # Start local dev stack (PostgreSQL, backend, Stellar Quickstart)
+    dr-backup           # Run disaster-recovery backup
     env-setup           # Copy .env.example to .env (skips if .env already exists)
     fmt                 # Auto-format all code
     fmt-check           # Check code formatting
+    frontend-dev        # Start frontend development server
+    frontend-test       # Run frontend tests
     test                # Run the full ttl_vault test suite
 ```
+
+### Frontend Development
+
+The `frontend-dev` and `frontend-test` commands simplify frontend work:
+
+```bash
+# Start the frontend dev server at http://localhost:5173
+just frontend-dev
+
+# Run the frontend test suite
+just frontend-test
+```
+
+These commands automatically install dependencies and run the appropriate npm scripts.
+
+### Disaster Recovery
+
+The `dr-backup` command runs the disaster-recovery backup script:
+
+```bash
+# Trigger a backup to the configured S3 bucket
+just dr-backup
+```
+
+See [RECOVERY_IMPLEMENTATION.md](RECOVERY_IMPLEMENTATION.md) for more details on disaster recovery procedures.
 
 ## Fuzz Testing
 
