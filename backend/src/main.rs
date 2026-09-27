@@ -9,6 +9,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
 mod auth;
@@ -27,6 +28,7 @@ mod routes;
 mod sanitization;
 mod scheduler;
 mod security_headers;
+mod ttl_watch;
 mod two_factor;
 mod webhook_retry;
 
@@ -39,18 +41,67 @@ pub use db::Db;
 // that includes the Metrics field (issue #1195).
 
 use crate::metrics::Metrics;
+use crate::rate_limit::{InMemoryRateLimitStore, RateLimitStore, RedisRateLimitStore};
+
+/// Default grace period for draining in-flight background work on shutdown.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Db>,
     pub consensus: Arc<NodeCache>,
     pub metrics: Arc<Metrics>,
+    /// Shared shutdown token signalled on SIGTERM/SIGINT (issue #1488).
+    pub shutdown: CancellationToken,
+    /// Rate-limit store backend (issue #1494). Defaults to in-memory for dev;
+    /// set `RATE_LIMIT_STORE=redis` (with `REDIS_URL`) to share state across
+    /// replicas and survive restarts.
+    pub rate_limit_store: Arc<dyn RateLimitStore>,
 }
 
 impl FromRef<AppState> for Arc<Db> {
     fn from_ref(state: &AppState) -> Arc<Db> {
         Arc::clone(&state.db)
     }
+}
+
+impl FromRef<AppState> for CancellationToken {
+    fn from_ref(state: &AppState) -> CancellationToken {
+        state.shutdown.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<dyn RateLimitStore> {
+    fn from_ref(state: &AppState) -> Arc<dyn RateLimitStore> {
+        Arc::clone(&state.rate_limit_store)
+    }
+}
+
+/// Builds the rate-limit store from environment configuration (issue #1494).
+///
+/// | `RATE_LIMIT_STORE` | `REDIS_URL` | Result                                  |
+/// |--------------------|-------------|-----------------------------------------|
+/// | unset / `memory`   | any         | In-memory store (default, dev-friendly) |
+/// | `redis`            | set         | Redis-backed store (shared, persistent) |
+/// | `redis`            | unset       | Falls back to in-memory with a warning  |
+fn build_rate_limit_store() -> Arc<dyn RateLimitStore> {
+    let backend = std::env::var("RATE_LIMIT_STORE").unwrap_or_default();
+    if backend.eq_ignore_ascii_case("redis") {
+        match std::env::var("REDIS_URL") {
+            Ok(url) if !url.is_empty() => {
+                tracing::info!("rate limiter using Redis-backed store");
+                return Arc::new(RedisRateLimitStore::new(url));
+            }
+            _ => {
+                tracing::warn!(
+                    "RATE_LIMIT_STORE=redis but REDIS_URL is unset; \
+                     falling back to in-memory rate-limit store"
+                );
+            }
+        }
+    }
+    tracing::info!("rate limiter using in-memory store");
+    Arc::new(InMemoryRateLimitStore::new())
 }
 
 /// Builds the CORS layer based on `APP_ENV` and `ALLOWED_ORIGINS` environment variables.
@@ -110,7 +161,7 @@ async fn health_handler() -> Json<serde_json::Value> {
 async fn ready_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
+    match state.db.check_connectivity().await {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
@@ -155,6 +206,37 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Waits for SIGTERM (or SIGINT) and then signals the shared shutdown token.
+///
+/// Issue #1488: graceful shutdown for background workers.
+async fn shutdown_signal(token: CancellationToken) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, starting graceful shutdown"),
+        _ = terminate => tracing::info!("received SIGTERM, starting graceful shutdown"),
+    }
+
+    // Signal every background task sharing this token to stop accepting work
+    // and drain in-flight jobs.
+    token.cancel();
+}
+
 #[tokio::main]
 async fn main() {
     // Initialise OpenTelemetry distributed tracing.
@@ -197,9 +279,12 @@ async fn main() {
         "database pool configuration"
     );
 
+    // Issue #1487: unify SQLite access on sqlx. The database is opened through
+    // the sqlx-backed `Db` handle and migrations are applied via `sqlx::migrate!`
+    // inside `Db::migrate`, so no rusqlite call sites remain here.
     let db =
         Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
-    db.migrate().expect("migration failed");
+    db.migrate().await.expect("migration failed");
 
     let consensus = NodeCache::from_env();
     tracing::info!(
@@ -208,99 +293,152 @@ async fn main() {
         "consensus cache initialized"
     );
 
+    // Rate-limit store: in-memory by default, Redis when configured (issue #1494).
+    let rate_limit_store = build_rate_limit_store();
+
+    // Shared shutdown token: every background task observes this and drains
+    // in-flight work when SIGTERM/SIGINT is received (issue #1488).
+    let shutdown = CancellationToken::new();
+
     let scheduler_db = Arc::clone(&db);
-    tokio::spawn(async move {
-        scheduler::run(scheduler_db).await;
+    let scheduler_shutdown = shutdown.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        scheduler::run(scheduler_db, scheduler_shutdown).await;
     });
 
-    let metrics = Metrics::new();
+    let webhook_db = Arc::clone(&db);
+    let webhook_shutdown = shutdown.clone();
+    let webhook_handle = tokio::spawn(async move {
+        webhook_retry::run(webhook_db, webhook_shutdown).await;
+    });
+
+    // #1596: warn owners when a vault's storage TTL nears archival.
+    let notification_service = Arc::new(notifications::NotificationService::new(
+        Arc::new(notifications::FcmClient::new(
+            std::env::var("FCM_SERVER_KEY").unwrap_or_default(),
+            std::env::var("FCM_PROJECT_ID").unwrap_or_default(),
+        )),
+        notifications::create_token_store(),
+        notifications::create_prefs_store(),
+        notifications::create_schedule_store(),
+        notifications::create_delivery_store(),
+    ));
+    notifications::start_scheduler(Arc::clone(&notification_service), 60);
+    ttl_watch::spawn(
+        Arc::clone(&db),
+        notification_service,
+        ttl_watch::TtlWatchConfig::from_env(),
+    );
 
     let state = AppState {
-        db,
-        consensus,
-        metrics,
+        db: Arc::clone(&db),
+        consensus: Arc::new(consensus),
+        metrics: Arc::new(Metrics::new()),
+        shutdown: shutdown.clone(),
+        rate_limit_store,
     };
 
-    let global_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(100, 60));
-    let checkin_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(1, 60));
-    let release_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(5, 60));
-    let email_token_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(3, 60));
-    let sensitive_limiter = rate_limit::RateLimiter::new(rate_limit::RateLimitConfig::new(20, 60));
+    let app = routes::build_router(state.clone());
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/health/consensus", get(consensus_health_handler))
-        .route("/ready", get(ready_handler))
-        .route("/metrics", get(metrics_handler))
-        .route(
-            "/api/vaults/:vault_id/reminder-preferences",
-            post(routes::set_preferences)
-                .layer(middleware::from_fn_with_state(
-                    sensitive_limiter.clone(),
-                    rate_limit::rate_limit_middleware,
-                ))
-                .get(routes::get_preferences)
-                .delete(routes::delete_preferences),
-        )
-        .route(
-            "/api/vaults/:vault_id/subscriptions",
-            post(routes::set_subscription)
-                .layer(middleware::from_fn_with_state(
-                    sensitive_limiter.clone(),
-                    rate_limit::rate_limit_middleware,
-                ))
-                .delete(routes::delete_subscription),
-        )
-        .route(
-            "/api/vaults/:vault_id/reminders",
-            get(routes::list_vault_reminders),
-        )
-        .route(
-            "/api/vaults/:vault_id/simulate-release",
-            get(routes::simulate_release),
-        )
-        .route(
-            "/api/vaults/:vault_id/sponsored-release",
-            post(routes::create_sponsored_release)
-                .layer(middleware::from_fn_with_state(
-                    sensitive_limiter,
-                    rate_limit::rate_limit_middleware,
-                ))
-                .get(routes::get_sponsored_releases),
-        )
-        .route(
-            "/api/vaults/:vault_id/vesting/claim-bonus",
-            post(routes::claim_vesting_bonus),
-        )
-        .route(
-            "/api/vaults/:vault_id/vesting/bonus",
-            get(routes::get_vesting_bonus),
-        )
-        .route(
-            "/api/vaults/:vault_id/release-history",
-            get(routes::get_vault_release_history),
-        )
-        .route(
-            "/api/vaults/:vault_id/check-in",
-            post(routes::check_in)
-                .layer(middleware::from_fn_with_state(checkin_limiter, rate_limit::checkin_rate_limit_middleware)),
-        )
-        .route("/api/auth/token", post(auth::login))
-        .route("/api/auth/refresh", post(auth::refresh))
-        .layer(build_cors_layer())
-        .layer(middleware::from_fn(sanitization::sanitize_request))
-        .layer(middleware::from_fn_with_state(
-            global_limiter,
-            rate_limit::rate_limit_middleware,
-        ))
-        // Outermost layer so every response — including CORS/rate-limit
-        // rejections — carries the baseline security headers.
-        .layer(middleware::from_fn(
-            security_headers::security_headers_middleware,
-        ))
-        .with_state(state);
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind address");
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    tracing::info!("listening on {}", addr);
+
+    let shutdown_for_server = shutdown.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal(shutdown_for_server).await;
+    });
+
+    if let Err(err) = server.await {
+        tracing::error!("server error: {}", err);
+    }
+
+    // Allow background workers to drain in-flight work before exiting.
+    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, shutdown.cancelled())
+        .await
+        .is_err()
+    {
+        tracing::warn!("shutdown drain timed out");
+    }
+
+    tracing::info!("shutdown complete");
+}
+
+/// Parses the `MIN_CONTRACT_VERSION` environment variable.
+fn parse_min_contract_version(raw: Option<String>) -> u32 {
+    raw.and_then(|v| v.parse().ok()).unwrap_or(1)
+}
+
+/// Result of a contract version compatibility check.
+#[derive(Debug)]
+struct VersionCheckResult {
+    compatible: bool,
+    error: Option<String>,
+}
+
+impl std::fmt::Display for VersionCheckResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(err) = &self.error {
+            write!(f, "contract version check error: {}", err)
+        } else if self.compatible {
+            write!(f, "contract version compatible")
+        } else {
+            write!(f, "contract version incompatible")
+        }
+    }
+}
+
+/// Checks the on-chain contract version against the configured minimum.
+async fn check_contract_version<F, Fut>(
+    fetch_version: F,
+    min_version: u32,
+) -> VersionCheckResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<u32, String>>,
+{
+    match fetch_version().await {
+        Ok(version) if version >= min_version => VersionCheckResult {
+            compatible: true,
+            error: None,
+        },
+        Ok(version) => VersionCheckResult {
+            compatible: false,
+            error: Some(format!(
+                "contract version {} is below minimum {}",
+                version, min_version
+            )),
+        },
+        Err(err) => VersionCheckResult {
+            compatible: false,
+            error: Some(err),
+        },
+    }
+=======
+    tracing::info!(%addr, "server listening");
+=======
+>>>>>>> cd0050c (fix: #1494 Fix: rate limiter state is per-process and resets on restart)
+
+    let shutdown_for_server = shutdown.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal(shutdown_for_server).await;
+    });
+
+    if let Err(err) = server.await {
+        tracing::error!("server error: {}", err);
+    }
+
+    // Allow background workers to drain in-flight work before exiting.
+    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, shutdown.cancelled())
+        .await
+        .is_err()
+    {
+        tracing::warn!("shutdown drain timed out");
+    }
+
+    tracing::info!("shutdown complete");
+>>>>>>> 246e897 (fix: #1488 Enhancement: add graceful shutdown for background workers)
 }

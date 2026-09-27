@@ -280,4 +280,91 @@ mod tests {
         // The most recent event should be T2.
         assert_eq!(events[0].tier, EscalationTier::T2);
     }
+
+    #[tokio::test]
+    async fn test_escalation_stops_after_check_in() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+        // T1 is dispatched first.
+        evaluate_vault(&db, 123, 100).await;
+        let initial_events = db.get_escalation_events(123).unwrap();
+        assert_eq!(initial_events.len(), 1);
+        assert_eq!(initial_events[0].tier, EscalationTier::T1);
+
+        // Simulate a check-in by clearing escalation state.
+        db.clear_escalation_state(123).unwrap();
+        let cleared_state = db.get_escalation_state(123).unwrap();
+        assert!(cleared_state.is_none(), "escalation state should be cleared after check-in");
+
+        // TTL is still within T1 range, but since state is cleared,
+        // a new escalation should be dispatched on re-evaluation.
+        evaluate_vault(&db, 123, 100).await;
+        let events_after_checkin = db.get_escalation_events(123).unwrap();
+        assert_eq!(
+            events_after_checkin.len(),
+            2,
+            "new escalation should be dispatched after check-in clears state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_t1_threshold_exact_boundary() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+        // Test exactly at T1 threshold (168 hours)
+        evaluate_vault(&db, 200, 168).await;
+        let events = db.get_escalation_events(200).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tier, EscalationTier::T1);
+    }
+
+    #[tokio::test]
+    async fn test_t2_threshold_exact_boundary() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+        // Test exactly at T2 threshold (72 hours)
+        evaluate_vault(&db, 201, 72).await;
+        let events = db.get_escalation_events(201).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tier, EscalationTier::T2);
+    }
+
+    #[tokio::test]
+    async fn test_t3_threshold_exact_boundary() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+        // Test exactly at T3 threshold (24 hours)
+        evaluate_vault(&db, 202, 24).await;
+        let events = db.get_escalation_events(202).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tier, EscalationTier::T3);
+    }
+
+    #[tokio::test]
+    async fn test_channels_dispatched_per_tier() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+        // Test T1 channels (email only)
+        evaluate_vault(&db, 300, 100).await;
+        let t1_events = db.get_escalation_events(300).unwrap();
+        assert_eq!(t1_events[0].channels, vec!["email"]);
+
+        // Clear and test T2 channels (email + sms)
+        db.clear_escalation_state(300).unwrap();
+        let mut state = db.get_escalation_state(300).unwrap();
+        state.escalated_at = Some(Utc::now() - chrono::Duration::hours(25));
+        db.upsert_escalation_state(&state).unwrap();
+        evaluate_vault(&db, 300, 48).await;
+        let t2_events = db.get_escalation_events(300).unwrap();
+        assert_eq!(t2_events[0].channels, vec!["email", "sms"]);
+
+        // Clear and test T3 channels (email + sms + emergency_contact)
+        db.clear_escalation_state(300).unwrap();
+        let mut state = db.get_escalation_state(300).unwrap();
+        state.escalated_at = Some(Utc::now() - chrono::Duration::hours(25));
+        db.upsert_escalation_state(&state).unwrap();
+        evaluate_vault(&db, 300, 12).await;
+        let t3_events = db.get_escalation_events(300).unwrap();
+        assert_eq!(t3_events[0].channels, vec!["email", "sms", "emergency_contact"]);
+    }
 }
