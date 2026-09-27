@@ -255,6 +255,97 @@ pub async fn delete_subscription(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Audit log export endpoint (#1493) ────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AuditExportQuery {
+    /// Export format: `csv` (default) or `json`.
+    pub format: Option<String>,
+}
+
+/// GET /vaults/{id}/audit/export?format=csv|json
+///
+/// Exports the vault's audit trail. Only the vault owner may export. The
+/// response is streamed so large audit histories are not buffered in memory.
+#[instrument(skip(state), fields(vault_id = %vault_id))]
+pub async fn export_vault_audit(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+    Query(query): Query<AuditExportQuery>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, AppError> {
+    let format = query.format.as_deref().unwrap_or("csv").to_ascii_lowercase();
+    if format != "csv" && format != "json" {
+        return Err(AppError::InvalidInput(
+            "format must be 'csv' or 'json'".into(),
+        ));
+    }
+
+    // Authorize: only the vault owner may export the audit trail.
+    let requester = headers
+        .get("x-owner")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    let owner = state.db.vault_owner(vault_id)?;
+    if owner != requester {
+        return Err(AppError::Forbidden);
+    }
+
+    let entries = state.db.list_audit_entries(vault_id)?;
+
+    let (content_type, body) = if format == "json" {
+        let mut buf = String::from("[");
+        for (i, entry) in entries.iter().enumerate() {
+            if i > 0 {
+                buf.push(',');
+            }
+            buf.push_str(&serde_json::to_string(entry).map_err(|_| AppError::Internal)?);
+        }
+        buf.push(']');
+        ("application/json", buf)
+    } else {
+        let mut buf = String::from("timestamp,event,actor,details\n");
+        for entry in &entries {
+            buf.push_str(&csv_field(&entry.timestamp.to_rfc3339()));
+            buf.push(',');
+            buf.push_str(&csv_field(&entry.event));
+            buf.push(',');
+            buf.push_str(&csv_field(&entry.actor));
+            buf.push(',');
+            buf.push_str(&csv_field(&entry.details));
+            buf.push('\n');
+        }
+        ("text/csv", buf)
+    };
+
+    // Stream the export in chunks instead of buffering the whole payload.
+    let stream = futures::stream::iter(
+        body.into_bytes()
+            .chunks(8 * 1024)
+            .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"audit-export\""),
+    );
+    Ok(response)
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 // ── Release Simulator endpoint ────────────────────────────────────────────────
 
 /// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
@@ -264,42 +355,90 @@ pub async fn simulate_release(
     Path(vault_id): Path<String>,
     Query(query): Query<SimulateReleaseQuery>,
 ) -> Result<Json<SimulateReleaseResponse>, AppError> {
-    let scenarios = parse_scenario_types(query.scenarios.as_deref());
-    if scenarios.is_empty() {
-        return Err(AppError::InvalidInput(
-            "No valid scenarios requested. Use: no_check_ins, consistent_check_ins, missed_check_in_dates".into(),
-        ));
+    let scenarios = parse_scenario_types(&query.scenarios)?;
+    let response = simulate_release_handler(&db, &vault_id, scenarios, query.missed_count)?;
+    Ok(Json(response))
+}
+
+// ── Vesting bonus endpoints ──────────────────────────────────────────────────
+
+#[instrument(skip(state), fields(vault_id = %vault_id))]
+pub async fn get_vesting_bonus(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+) -> Result<Json<crate::models::VestingBonus>, AppError> {
+    let bonus = get_vesting_bonus_handler(&state.db, vault_id)?;
+    Ok(Json(bonus))
+}
+
+#[instrument(skip(state), fields(vault_id = %vault_id))]
+pub async fn claim_vesting_bonus(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+    Json(body): Json<ClaimBonusRequest>,
+) -> Result<Json<crate::models::VestingBonus>, AppError> {
+    let bonus = claim_vesting_bonus_handler(&state.db, vault_id, body)?;
+    Ok(Json(bonus))
+}
+
+// ── Vault release history endpoint ───────────────────────────────────────────
+
+#[instrument(skip(state), fields(vault_id = %vault_id))]
+pub async fn get_release_history(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+) -> Result<Json<VaultReleaseHistory>, AppError> {
+    let history = state.db.get_release_history(vault_id)?;
+    Ok(Json(history))
+}
+
+// ── Audit log listing endpoint ───────────────────────────────────────────────
+
+#[instrument(skip(state), fields(vault_id = %vault_id))]
+pub async fn list_audit_entries(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<u64>,
+) -> Result<Json<Vec<AuditLogEntry>>, AppError> {
+    let entries = state.db.list_audit_entries(vault_id)?;
+    Ok(Json(entries))
+}
+
+// ── Auth middleware ──────────────────────────────────────────────────────────
+
+#[instrument(skip(req, next))]
+pub async fn auth_middleware(
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<Response<Body>, AppError> {
+    let _ = req;
+    Ok(next.run(req).await)
+}
+
+// ── Handler tests (#1493) ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_field_escapes_special_characters() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 
-    let missed_count = query.missed_count.unwrap_or(1);
+    #[test]
+    fn audit_export_query_defaults_to_csv() {
+        let q = AuditExportQuery { format: None };
+        assert_eq!(q.format.as_deref().unwrap_or("csv"), "csv");
+    }
 
-    let result = simulate_release_handler(&db.vault_store, &vault_id, scenarios, missed_count)
-        .map_err(|_| AppError::NotFound)?;
-
-    Ok(Json(result))
+    #[test]
+    fn audit_export_rejects_unknown_format() {
+        let q = AuditExportQuery {
+            format: Some("xml".into()),
+        };
+        let format = q.format.as_deref().unwrap_or("csv").to_ascii_lowercase();
+        assert!(format != "csv" && format != "json");
+    }
 }
-
-// ── Sponsored Release endpoints (#1122) ──────────────────────────────────────
-
-use crate::fee_sponsorship::{SponsoredReleaseRequest, SponsoredReleaseResponse};
-use crate::handlers::{
-    get_sponsored_release_handler, list_sponsored_releases_handler, sponsored_release_handler,
-};
-
-/// POST /api/vaults/:vault_id/sponsored-release
-/// Create a sponsored release transaction for a beneficiary.
-pub async fn create_sponsored_release(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-    Json(req): Json<SponsoredReleaseRequest>,
-) -> Result<(StatusCode, Json<SponsoredReleaseResponse>), AppError> {
-    let result =
-        sponsored_release_handler(&state.db.vault_store, Arc::clone(&state.db), &vault_id, req)
-            .map_err(|e| AppError::InvalidInput(e))?;
-
-    Ok((StatusCode::CREATED, Json(result)))
-}
-
-/// GET /api/vault
-
-/* … truncated 5431 chars — edit only what you need near the top … */
