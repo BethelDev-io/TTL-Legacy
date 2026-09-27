@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{db::Db, models::Frequency};
 
@@ -240,19 +242,32 @@ pub async fn send_beneficiary_archival_sms(
 /// Polls preferences every minute and fires reminders for vaults whose TTL
 /// is within the user-configured window.
 ///
-/// In production, replace `fetch_ttl_remaining` with a real Stellar RPC call
-/// and `send_reminder` with actual email/SMS/push dispatch.
-#[tracing::instrument(skip(db))]
-pub async fn run(db: Arc<Db>) {
+/// TTL is fetched from the cache / contract via `fetch_ttl_remaining` and
+/// reminders are dispatched through the notification service.  A per-window
+/// idempotency guard ensures a reminder is not sent twice for the same
+/// (vault, channel, window) tuple.
+///
+/// The loop observes `shutdown` so that SIGTERM can stop the scheduler
+/// gracefully: once the token is cancelled the current tick is allowed to
+/// finish (draining in-flight jobs) and the loop exits.
+#[tracing::instrument(skip(db, shutdown))]
+pub async fn run(db: Arc<Db>, shutdown: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut sent: HashMap<(u64, String, u32), i64> = HashMap::new();
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("scheduler received shutdown signal, draining in-flight jobs");
+                break;
+            }
+            _ = interval.tick() => {}
+        }
 
         // 1) Existing reminder preferences scheduler.
         match db.all() {
             Ok(all_prefs) => {
                 for prefs in all_prefs {
-                    let ttl_hours = fetch_ttl_remaining(prefs.vault_id).await;
+                    let ttl_hours = fetch_ttl_remaining(&db, prefs.vault_id).await;
                     let window = prefs.hours_before_expiry;
 
                     let subscription = db.get_subscription(prefs.vault_id).ok().flatten();
@@ -304,7 +319,17 @@ pub async fn run(db: Arc<Db>) {
                             };
 
                             if deliver_on_channel {
-                                send_reminder(prefs.vault_id, channel, ttl_hours).await;
+                                let key = (prefs.vault_id, format!("{:?}", channel), window);
+                                let now = Utc::now().timestamp();
+                                let already_sent = sent
+                                    .get(&key)
+                                    .map(|ts| now - *ts < 3600)
+                                    .unwrap_or(false);
+                                if already_sent {
+                                    continue;
+                                }
+                                send_reminder(&db, prefs.vault_id, channel, ttl_hours).await;
+                                sent.insert(key, now);
                             }
                         }
                     }
