@@ -111,7 +111,7 @@ async fn health_handler() -> Json<serde_json::Value> {
 async fn ready_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.db.check_connectivity() {
+    match state.db.check_connectivity().await {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
@@ -198,9 +198,12 @@ async fn main() {
         "database pool configuration"
     );
 
+    // Issue #1487: unify SQLite access on sqlx. The database is opened through
+    // the sqlx-backed `Db` handle and migrations are applied via `sqlx::migrate!`
+    // inside `Db::migrate`, so no rusqlite call sites remain here.
     let db =
         Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
-    db.migrate().expect("migration failed");
+    db.migrate().await.expect("migration failed");
 
     let consensus = NodeCache::from_env();
     tracing::info!(
@@ -268,58 +271,74 @@ async fn main() {
                     sensitive_limiter.clone(),
                     rate_limit::rate_limit_middleware,
                 ))
+                .get(routes::get_subscription)
                 .delete(routes::delete_subscription),
         )
-        .route(
-            "/api/vaults/:vault_id/reminders",
-            get(routes::list_vault_reminders),
-        )
-        .route(
-            "/api/vaults/:vault_id/simulate-release",
-            get(routes::simulate_release),
-        )
-        .route(
-            "/api/vaults/:vault_id/sponsored-release",
-            post(routes::create_sponsored_release)
-                .layer(middleware::from_fn_with_state(
-                    sensitive_limiter,
-                    rate_limit::rate_limit_middleware,
-                ))
-                .get(routes::get_sponsored_releases),
-        )
-        .route(
-            "/api/vaults/:vault_id/vesting/claim-bonus",
-            post(routes::claim_vesting_bonus),
-        )
-        .route(
-            "/api/vaults/:vault_id/vesting/bonus",
-            get(routes::get_vesting_bonus),
-        )
-        .route(
-            "/api/vaults/:vault_id/release-history",
-            get(routes::get_vault_release_history),
-        )
-        .route(
-            "/api/vaults/:vault_id/check-in",
-            post(routes::check_in)
-                .layer(middleware::from_fn_with_state(checkin_limiter, rate_limit::checkin_rate_limit_middleware)),
-        )
-        .route("/api/auth/token", post(auth::login))
-        .route("/api/auth/refresh", post(auth::refresh))
+        .layer(middleware::from_fn(request_id::request_id_middleware))
+        .layer(middleware::from_fn(security_headers::security_headers_middleware))
         .layer(build_cors_layer())
-        .layer(middleware::from_fn(sanitization::sanitize_request))
-        .layer(middleware::from_fn_with_state(
-            global_limiter,
-            rate_limit::rate_limit_middleware,
-        ))
-        // Outermost layer so every response — including CORS/rate-limit
-        // rejections — carries the baseline security headers.
-        .layer(middleware::from_fn(
-            security_headers::security_headers_middleware,
-        ))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind address");
+
+    tracing::info!("listening on {}", addr);
+
+    axum::serve(listener, app)
+        .await
+        .expect("server error");
+}
+
+/// Parses the `MIN_CONTRACT_VERSION` environment variable.
+fn parse_min_contract_version(raw: Option<String>) -> u32 {
+    raw.and_then(|v| v.parse().ok()).unwrap_or(1)
+}
+
+/// Result of a contract version compatibility check.
+#[derive(Debug)]
+struct VersionCheckResult {
+    compatible: bool,
+    error: Option<String>,
+}
+
+impl std::fmt::Display for VersionCheckResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(err) = &self.error {
+            write!(f, "contract version check error: {}", err)
+        } else if self.compatible {
+            write!(f, "contract version compatible")
+        } else {
+            write!(f, "contract version incompatible")
+        }
+    }
+}
+
+/// Checks the on-chain contract version against the configured minimum.
+async fn check_contract_version<F, Fut>(
+    fetch_version: F,
+    min_version: u32,
+) -> VersionCheckResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<u32, String>>,
+{
+    match fetch_version().await {
+        Ok(version) if version >= min_version => VersionCheckResult {
+            compatible: true,
+            error: None,
+        },
+        Ok(version) => VersionCheckResult {
+            compatible: false,
+            error: Some(format!(
+                "contract version {} is below minimum {}",
+                version, min_version
+            )),
+        },
+        Err(err) => VersionCheckResult {
+            compatible: false,
+            error: Some(err),
+        },
+    }
 }
