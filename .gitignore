@@ -50,7 +50,9 @@ build/
 *.tsbuildinfo
 
 # ── Android build artifacts ───────────────────────────────────────────────────
+.gradle/
 mobile/android/.gradle/
+mobile/android/app/.gradle/
 mobile/android/app/build/
 mobile/android/local.properties
 mobile/android/**/*.apk
