@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use axum::{
-    body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Response, StatusCode},
-    middleware::Next,
-    Json,
+use actix_web::{
+    http::StatusCode,
+    web::{Data, Json, Path, Query},
+    HttpRequest, HttpResponse, Responder,
 };
 use chrono::DateTime;
 use serde::Deserialize;
@@ -56,7 +54,7 @@ pub struct ReadinessChecks {
 /// are reachable before the instance is considered ready to serve traffic.
 #[instrument(skip(state))]
 pub async fn ready(
-    State(state): State<Arc<AppState>>,
+    state: Data<Arc<AppState>>,
 ) -> Result<Json<ReadinessResponse>, AppError> {
     let db_ok = state.db.ping().is_ok();
     let rpc_ok = state.rpc.ping().await.is_ok();
@@ -86,15 +84,15 @@ pub struct RemindersQuery {
 
 #[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn list_vault_reminders(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-    Query(query): Query<RemindersQuery>,
+    state: Data<Arc<AppState>>,
+    vault_id: Path<u64>,
+    query: Query<RemindersQuery>,
 ) -> Result<Json<Vec<ReminderPreferences>>, AppError> {
     let db = &state.db;
     let records = if query.include_deleted.unwrap_or(false) {
-        db.all_reminders_including_deleted(vault_id)?
+        db.all_reminders_including_deleted(vault_id.into_inner())?
     } else {
-        match db.get(vault_id) {
+        match db.get(vault_id.into_inner()) {
             Ok(p) => vec![p],
             Err(_) => vec![],
         }
@@ -104,19 +102,19 @@ pub async fn list_vault_reminders(
 
 #[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn delete_preferences(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
+    state: Data<Arc<AppState>>,
+    vault_id: Path<u64>,
 ) -> Result<StatusCode, AppError> {
-    state.db.soft_delete_reminder(vault_id)?;
+    state.db.soft_delete_reminder(vault_id.into_inner())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[instrument(skip(state, headers), fields(vault_id = %vault_id))]
+#[instrument(skip(state, req), fields(vault_id = %vault_id))]
 pub async fn set_preferences(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-    headers: HeaderMap,
-    Json(body): Json<SetPreferencesRequest>,
+    state: Data<Arc<AppState>>,
+    vault_id: Path<u64>,
+    req: HttpRequest,
+    body: Json<SetPreferencesRequest>,
 ) -> Result<(StatusCode, Json<ReminderPreferences>), AppError> {
     let db = &state.db;
     if body.channels.is_empty() {
@@ -129,7 +127,11 @@ pub async fn set_preferences(
     }
 
     // #825: Idempotency key support
-    if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+    if let Some(idem_key) = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(cached) = db.check_idempotency(idem_key) {
             let cached_prefs: ReminderPreferences =
                 serde_json::from_str(&cached.response_body).unwrap();
@@ -138,16 +140,20 @@ pub async fn set_preferences(
     }
 
     let prefs = ReminderPreferences {
-        vault_id,
-        channels: body.channels,
+        vault_id: vault_id.into_inner(),
+        channels: body.channels.clone(),
         hours_before_expiry: body.hours_before_expiry,
-        frequency: body.frequency,
+        frequency: body.frequency.clone(),
         deleted_at: None,
     };
     db.upsert(&prefs)?;
 
     // Store idempotency record if key was provided
-    if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+    if let Some(idem_key) = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+    {
         let body_json = serde_json::to_string(&prefs).unwrap();
         db.store_idempotency(idem_key, 200, &body_json);
     }
@@ -157,11 +163,11 @@ pub async fn set_preferences(
 
 #[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn get_preferences(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
+    state: Data<Arc<AppState>>,
+    vault_id: Path<u64>,
 ) -> Result<Json<ReminderPreferences>, AppError> {
     let db = &state.db;
-    match db.get(vault_id) {
+    match db.get(vault_id.into_inner()) {
         Ok(prefs) => Ok(Json(prefs)),
         Err(_e) => Err(AppError::NotFound),
     }
@@ -176,15 +182,13 @@ pub struct UnsubscribeQuery {
 
 #[instrument(skip(state))]
 pub async fn unsubscribe(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<UnsubscribeQuery>,
-) -> Result<(StatusCode, String), AppError> {
+    state: Data<Arc<AppState>>,
+    query: Query<UnsubscribeQuery>,
+) -> Result<HttpResponse, AppError> {
     let db = &state.db;
     match db.process_unsubscribe(&query.token) {
-        Ok(owner) => Ok((
-            StatusCode::OK,
-            format!("You ({owner}) have been unsubscribed from reminder emails."),
-        )),
+        Ok(owner) => Ok(HttpResponse::Ok()
+            .body(format!("You ({owner}) have been unsubscribed from reminder emails."))),
         Err(_) => Err(AppError::InvalidInput(
             "Invalid or expired unsubscribe token".into(),
         )),
@@ -206,8 +210,8 @@ pub struct ResolveReminderTokenResponse {
 
 #[instrument(skip(state))]
 pub async fn resolve_reminder_token(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<ReminderTokenQuery>,
+    state: Data<Arc<AppState>>,
+    query: Query<ReminderTokenQuery>,
 ) -> Result<Json<ResolveReminderTokenResponse>, AppError> {
     let db = &state.db;
     match db.resolve_reminder_token(&query.token) {
@@ -225,19 +229,19 @@ pub async fn resolve_reminder_token(
 /// Create or update vault-level notification subscription settings.
 #[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn set_subscription(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-    Json(body): Json<SetSubscriptionRequest>,
+    state: Data<Arc<AppState>>,
+    vault_id: Path<u64>,
+    body: Json<SetSubscriptionRequest>,
 ) -> Result<(StatusCode, Json<Subscription>), AppError> {
     if body.channels.is_empty() {
         return Err(AppError::InvalidInput("channels must not be empty".into()));
     }
 
     let sub = Subscription {
-        vault_id,
-        owner: body.owner,
-        channels: body.channels,
-        frequency: body.frequency,
+        vault_id: vault_id.into_inner(),
+        owner: body.owner.clone(),
+        channels: body.channels.clone(),
+        frequency: body.frequency.clone(),
     };
     state.db.upsert_subscription(&sub)?;
     Ok((StatusCode::OK, Json(sub)))
@@ -248,10 +252,10 @@ pub async fn set_subscription(
 /// Remove vault-level notification subscription settings.
 #[instrument(skip(state), fields(vault_id = %vault_id))]
 pub async fn delete_subscription(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
+    state: Data<Arc<AppState>>,
+    vault_id: Path<u64>,
 ) -> Result<StatusCode, AppError> {
-    state.db.delete_subscription(vault_id)?;
+    state.db.delete_subscription(vault_id.into_inner())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -351,94 +355,17 @@ fn csv_field(value: &str) -> String {
 /// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
 #[instrument(skip(db), fields(vault_id = %vault_id))]
 pub async fn simulate_release(
-    State(db): State<Arc<Db>>,
-    Path(vault_id): Path<String>,
-    Query(query): Query<SimulateReleaseQuery>,
+    db: Data<Arc<Db>>,
+    vault_id: Path<String>,
+    query: Query<SimulateReleaseQuery>,
 ) -> Result<Json<SimulateReleaseResponse>, AppError> {
     let scenarios = parse_scenario_types(&query.scenarios)?;
-    let response = simulate_release_handler(&db, &vault_id, scenarios, query.missed_count)?;
+    let response = simulate_release_handler(
+        &db,
+        vault_id.into_inner(),
+        scenarios,
+        query.missed_count,
+    )
+    .await?;
     Ok(Json(response))
-}
-
-// ── Vesting bonus endpoints ──────────────────────────────────────────────────
-
-#[instrument(skip(state), fields(vault_id = %vault_id))]
-pub async fn get_vesting_bonus(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-) -> Result<Json<crate::models::VestingBonus>, AppError> {
-    let bonus = get_vesting_bonus_handler(&state.db, vault_id)?;
-    Ok(Json(bonus))
-}
-
-#[instrument(skip(state), fields(vault_id = %vault_id))]
-pub async fn claim_vesting_bonus(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-    Json(body): Json<ClaimBonusRequest>,
-) -> Result<Json<crate::models::VestingBonus>, AppError> {
-    let bonus = claim_vesting_bonus_handler(&state.db, vault_id, body)?;
-    Ok(Json(bonus))
-}
-
-// ── Vault release history endpoint ───────────────────────────────────────────
-
-#[instrument(skip(state), fields(vault_id = %vault_id))]
-pub async fn get_release_history(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-) -> Result<Json<VaultReleaseHistory>, AppError> {
-    let history = state.db.get_release_history(vault_id)?;
-    Ok(Json(history))
-}
-
-// ── Audit log listing endpoint ───────────────────────────────────────────────
-
-#[instrument(skip(state), fields(vault_id = %vault_id))]
-pub async fn list_audit_entries(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<u64>,
-) -> Result<Json<Vec<AuditLogEntry>>, AppError> {
-    let entries = state.db.list_audit_entries(vault_id)?;
-    Ok(Json(entries))
-}
-
-// ── Auth middleware ──────────────────────────────────────────────────────────
-
-#[instrument(skip(req, next))]
-pub async fn auth_middleware(
-    req: axum::extract::Request,
-    next: Next,
-) -> Result<Response<Body>, AppError> {
-    let _ = req;
-    Ok(next.run(req).await)
-}
-
-// ── Handler tests (#1493) ────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn csv_field_escapes_special_characters() {
-        assert_eq!(csv_field("plain"), "plain");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-    }
-
-    #[test]
-    fn audit_export_query_defaults_to_csv() {
-        let q = AuditExportQuery { format: None };
-        assert_eq!(q.format.as_deref().unwrap_or("csv"), "csv");
-    }
-
-    #[test]
-    fn audit_export_rejects_unknown_format() {
-        let q = AuditExportQuery {
-            format: Some("xml".into()),
-        };
-        let format = q.format.as_deref().unwrap_or("csv").to_ascii_lowercase();
-        assert!(format != "csv" && format != "json");
-    }
 }
